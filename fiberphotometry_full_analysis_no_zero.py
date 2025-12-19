@@ -1,8 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Long-term fiber photometry batch analysis script
+Long-term fiber photometry batch analysis script (GitHub-ready)
 (For lock-in demodulated CSV files)
+
+This version is intended to reproduce the same results as the "paper-used" code:
+- Uses pandas Series mean/std behavior (std uses ddof=1 by default)
+- No extra fail-safe branches that could change outputs
+- No personal paths; all paths are CLI-configurable
 
 Inputs:
 - CSV files in a specified data directory (one file per animal)
@@ -12,45 +17,39 @@ Outputs:
 (2) summary_analysis.xlsx (with an explanation sheet)
 (3) all_animals_traces.xlsx (second-binned mean across animals)
 
-Notes:
-- This script assumes each CSV contains columns for Time and fluorescence channels
-  (e.g., GFP/465 and Tomato/405). The header row may appear within the first 5 lines.
-- Adjust CLI parameters if your column names or baseline windows differ.
+Assumptions:
+- Each CSV contains columns for Time and fluorescence channels (e.g., GFP/465 and Tomato/405)
+- The header row may appear within the first 5 lines
+- Animal ID is inferred from the file name as the prefix before the first underscore ("_")
 """
 
 import os
 import glob
 import argparse
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
 # -----------------------------
-# Processing functions
+# Processing functions (paper-matched behavior)
 # -----------------------------
 def correct_photobleaching(ts, ys, pre_interval, post_interval):
     """
     Simple linear photobleaching correction using means from two time windows.
     Returns ys with a fitted line (from pre/post means) subtracted.
-    """
-    ts = np.asarray(ts)
-    ys = np.asarray(ys)
 
+    NOTE: Kept consistent with the original/paper-used script (no extra fail-safes).
+    """
     pre_mask = (ts >= pre_interval[0]) & (ts <= pre_interval[1])
     post_mask = (ts >= post_interval[0]) & (ts <= post_interval[1])
-
-    if pre_mask.sum() == 0 or post_mask.sum() == 0:
-        # If either window has no points, return original (fail-safe)
-        return ys
 
     pre_mean = ys[pre_mask].mean()
     post_mean = ys[post_mask].mean()
 
-    # Slope based on (post_mean - pre_mean) over time distance between window centers
     slope = (post_mean - pre_mean) / (post_interval[1] - pre_interval[0])
     intercept = pre_mean - slope * pre_interval[0]
-
     return ys - (slope * ts + intercept)
 
 
@@ -58,54 +57,46 @@ def correct_motion(fluo465, fluo405):
     """
     Motion correction by linear regression of 405 onto 465:
     465_corrected = 465 - (fit(405)->465 - mean(fit))
-    Returns: (405_copy, 465_motion_corrected)
-    """
-    fluo465 = np.asarray(fluo465)
-    fluo405 = np.asarray(fluo405)
 
+    NOTE: Kept consistent with the original/paper-used script.
+    """
     A = np.vstack([fluo405, np.ones_like(fluo405)]).T
     coeffs, _, _, _ = np.linalg.lstsq(A, fluo465, rcond=None)
     fitted = A @ coeffs
-
     return fluo405, fluo465 - (fitted - np.mean(fitted))
 
 
 def transform_to_zscore(ts, ys, baseline_interval=(0, 60)):
     """
     Z-score normalization using a global baseline interval.
+
+    CRITICAL:
+    - Uses pandas Series .std() default (ddof=1), matching the paper-used code.
     """
-    ts = np.asarray(ts)
-    ys = np.asarray(ys)
-
     mask = (ts >= baseline_interval[0]) & (ts <= baseline_interval[1])
-    if mask.sum() == 0:
-        return (ys - np.mean(ys)) / (np.std(ys) if np.std(ys) > 0 else 1.0)
-
     baseline_mean = ys[mask].mean()
-    baseline_std = ys[mask].std()
-    if baseline_std == 0 or np.isnan(baseline_std):
-        baseline_std = 1.0
+    baseline_std = ys[mask].std()  # pandas default ddof=1
     return (ys - baseline_mean) / baseline_std
 
 
 def compute_auc(ts, ys):
-    ts = np.asarray(ts)
-    ys = np.asarray(ys)
     return np.trapz(ys, ts)
 
 
 def compute_peak(ys):
-    ys = np.asarray(ys)
     idx = int(np.argmax(ys))
     return float(ys[idx]), idx
 
 
 def read_and_clean_csv(filepath):
     """
-    Detect the true header row within the first 5 lines (looking for Time and gfp),
+    Detect the true header row within the first 5 lines (looking for 'Time' and 'gfp'),
     then read that CSV into a DataFrame and keep Time/GFP/Tomato-related columns.
+
+    NOTE:
+    - Mirrors the paper-used behavior: open() without explicit encoding.
     """
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+    with open(filepath, "r") as f:
         lines = f.readlines()
 
     header_candidates = [line.strip().split(",") for line in lines[:5]]
@@ -139,25 +130,36 @@ def main():
         description="Long-term fiber photometry batch analysis (lock-in demodulated CSV -> Z-score, metrics, SVG, Excel)."
     )
 
-    # Paths (generic; no personal information)
-    parser.add_argument("--data_dir", type=str, default="./Dric_CSV", help="Input directory containing raw CSV files.")
-    parser.add_argument("--out_data_dir", type=str, default="./Dric_CSV_Finish", help="Output directory for per-animal CSV/SVG.")
-    parser.add_argument("--summary_out_dir", type=str, default="./Dric_CSV_Summary", help="Output directory for summary Excel files.")
+    # Paths (generic)
+    parser.add_argument("--data_dir", type=str, default="./Dric_CSV",
+                        help="Input directory containing raw CSV files.")
+    parser.add_argument("--out_data_dir", type=str, default="./Dric_CSV_Finish",
+                        help="Output directory for per-animal CSV/SVG.")
+    parser.add_argument("--summary_out_dir", type=str, default="./Dric_CSV_Summary",
+                        help="Output directory for summary Excel files.")
 
-    # Baselines / windows
-    parser.add_argument("--baseline_global_start", type=float, default=1500.0, help="Global baseline interval start (s) for Z-score.")
-    parser.add_argument("--baseline_global_end", type=float, default=2100.0, help="Global baseline interval end (s) for Z-score.")
+    # Baseline / windows
+    parser.add_argument("--baseline_global_start", type=float, default=1500.0,
+                        help="Global baseline interval start (s) for Z-score.")
+    parser.add_argument("--baseline_global_end", type=float, default=2100.0,
+                        help="Global baseline interval end (s) for Z-score.")
 
-    parser.add_argument("--pb_pre_start", type=float, default=100.0, help="Photobleaching pre-window start (s).")
-    parser.add_argument("--pb_pre_end", type=float, default=600.0, help="Photobleaching pre-window end (s).")
+    parser.add_argument("--pb_pre_start", type=float, default=100.0,
+                        help="Photobleaching pre-window start (s).")
+    parser.add_argument("--pb_pre_end", type=float, default=600.0,
+                        help="Photobleaching pre-window end (s).")
 
     # End-anchored post window: [max_time - pb_post_start, max_time - pb_post_end]
-    parser.add_argument("--pb_post_start", type=float, default=500.0, help="Photobleaching post-window offset start from end (s).")
-    parser.add_argument("--pb_post_end", type=float, default=0.0, help="Photobleaching post-window offset end from end (s).")
+    parser.add_argument("--pb_post_start", type=float, default=500.0,
+                        help="Photobleaching post-window offset start from end (s).")
+    parser.add_argument("--pb_post_end", type=float, default=0.0,
+                        help="Photobleaching post-window offset end from end (s).")
 
     # Plot window
-    parser.add_argument("--plot_start", type=float, default=2700.0, help="Plot start time (s).")
-    parser.add_argument("--plot_end_cap", type=float, default=24300.0, help="Plot end time cap (s).")
+    parser.add_argument("--plot_start", type=float, default=2700.0,
+                        help="Plot start time (s).")
+    parser.add_argument("--plot_end_cap", type=float, default=24300.0,
+                        help="Plot end time cap (s).")
 
     args = parser.parse_args()
 
@@ -227,7 +229,11 @@ def main():
         df["fluo465-pbc"] = correct_photobleaching(df["time"], df["F-465"], pre_interval, post_interval)
         df["fluo405-pbc"] = correct_photobleaching(df["time"], df["AF-405"], pre_interval, post_interval)
 
-        df["fluo405-maf"], df["fluo465-mac"] = correct_motion(df["fluo465-pbc"], df["fluo405-pbc"])
+        df["fluo405-maf"], df["fluo465-mac"] = correct_motion(df["fluo465-pbc"].values, df["fluo405-pbc"].values)
+        # Put back into Series aligned with df index
+        df["fluo405-maf"] = pd.Series(df["fluo405-maf"], index=df.index)
+        df["fluo465-mac"] = pd.Series(df["fluo465-mac"], index=df.index)
+
         df["fluo465-zsc"] = transform_to_zscore(df["time"], df["fluo465-mac"], baseline_interval=baseline_interval_global)
 
         # Save per-animal processed CSV
@@ -263,9 +269,9 @@ def main():
                 continue
 
             mean_z = float(w["fluo465-zsc"].mean())
-            std_z = float(w["fluo465-zsc"].std())
-            auc_z = float(compute_auc(w["time"], w["fluo465-zsc"]))
-            peak_z, peak_idx = compute_peak(w["fluo465-zsc"])
+            std_z = float(w["fluo465-zsc"].std())  # pandas ddof=1
+            auc_z = float(compute_auc(w["time"].values, w["fluo465-zsc"].values))
+            peak_z, peak_idx = compute_peak(w["fluo465-zsc"].values)
             peak_time = float(w.loc[peak_idx, "time"])
 
             animal_metrics[f"{label}_mean"] = mean_z
@@ -349,4 +355,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
