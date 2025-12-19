@@ -1,199 +1,352 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Long-term fiber photometry batch analysis script
+(For lock-in demodulated CSV files)
+
+Inputs:
+- CSV files in a specified data directory (one file per animal)
+
+Outputs:
+(1) Per-animal processed CSV (Z-score trace etc.) + SVG trace plot
+(2) summary_analysis.xlsx (with an explanation sheet)
+(3) all_animals_traces.xlsx (second-binned mean across animals)
+
+Notes:
+- This script assumes each CSV contains columns for Time and fluorescence channels
+  (e.g., GFP/465 and Tomato/405). The header row may appear within the first 5 lines.
+- Adjust CLI parameters if your column names or baseline windows differ.
+"""
+
 import os
 import glob
-import pandas as pd
+import argparse
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
-from scipy.signal import find_peaks
-from scipy.integrate import simpson
-from openpyxl import Workbook
 
-# === 設定 ===
-sampling_rate = 2  # Hz
-block_duration_sec = 2 * 60 * 60
-baseline_duration_sec = 30 * 60
-block_points = block_duration_sec * sampling_rate
-baseline_points = baseline_duration_sec * sampling_rate
-window_size = 301  # 移動中央値のウィンドウサイズ
 
-# === フォルダ設定 ===
-desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
-input_folder = os.path.join(desktop_path, 'Dric_CSV')
-output_folder = os.path.join(desktop_path, 'CSV_finish')
-os.makedirs(input_folder, exist_ok=True)
-os.makedirs(output_folder, exist_ok=True)
+# -----------------------------
+# Processing functions
+# -----------------------------
+def correct_photobleaching(ts, ys, pre_interval, post_interval):
+    """
+    Simple linear photobleaching correction using means from two time windows.
+    Returns ys with a fitted line (from pre/post means) subtracted.
+    """
+    ts = np.asarray(ts)
+    ys = np.asarray(ys)
 
-# === CSVファイル取得 ===
-csv_files = glob.glob(os.path.join(input_folder, '*.csv'))
-sample_names = [os.path.splitext(os.path.basename(f))[0] for f in csv_files]
+    pre_mask = (ts >= pre_interval[0]) & (ts <= pre_interval[1])
+    post_mask = (ts >= post_interval[0]) & (ts <= post_interval[1])
 
-if not csv_files:
-    print("⚠ Dric_CSV フォルダにCSVファイルがありません。")
-else:
-    for file_path in csv_files:
-        filename = os.path.basename(file_path)
-        base_name = os.path.splitext(filename)[0]
-        print(f"▶ 処理中: {filename}")
+    if pre_mask.sum() == 0 or post_mask.sum() == 0:
+        # If either window has no points, return original (fail-safe)
+        return ys
+
+    pre_mean = ys[pre_mask].mean()
+    post_mean = ys[post_mask].mean()
+
+    # Slope based on (post_mean - pre_mean) over time distance between window centers
+    slope = (post_mean - pre_mean) / (post_interval[1] - pre_interval[0])
+    intercept = pre_mean - slope * pre_interval[0]
+
+    return ys - (slope * ts + intercept)
+
+
+def correct_motion(fluo465, fluo405):
+    """
+    Motion correction by linear regression of 405 onto 465:
+    465_corrected = 465 - (fit(405)->465 - mean(fit))
+    Returns: (405_copy, 465_motion_corrected)
+    """
+    fluo465 = np.asarray(fluo465)
+    fluo405 = np.asarray(fluo405)
+
+    A = np.vstack([fluo405, np.ones_like(fluo405)]).T
+    coeffs, _, _, _ = np.linalg.lstsq(A, fluo465, rcond=None)
+    fitted = A @ coeffs
+
+    return fluo405, fluo465 - (fitted - np.mean(fitted))
+
+
+def transform_to_zscore(ts, ys, baseline_interval=(0, 60)):
+    """
+    Z-score normalization using a global baseline interval.
+    """
+    ts = np.asarray(ts)
+    ys = np.asarray(ys)
+
+    mask = (ts >= baseline_interval[0]) & (ts <= baseline_interval[1])
+    if mask.sum() == 0:
+        return (ys - np.mean(ys)) / (np.std(ys) if np.std(ys) > 0 else 1.0)
+
+    baseline_mean = ys[mask].mean()
+    baseline_std = ys[mask].std()
+    if baseline_std == 0 or np.isnan(baseline_std):
+        baseline_std = 1.0
+    return (ys - baseline_mean) / baseline_std
+
+
+def compute_auc(ts, ys):
+    ts = np.asarray(ts)
+    ys = np.asarray(ys)
+    return np.trapz(ys, ts)
+
+
+def compute_peak(ys):
+    ys = np.asarray(ys)
+    idx = int(np.argmax(ys))
+    return float(ys[idx]), idx
+
+
+def read_and_clean_csv(filepath):
+    """
+    Detect the true header row within the first 5 lines (looking for Time and gfp),
+    then read that CSV into a DataFrame and keep Time/GFP/Tomato-related columns.
+    """
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    header_candidates = [line.strip().split(",") for line in lines[:5]]
+    true_header_line = None
+    for i, cols in enumerate(header_candidates):
+        if any("Time" in c for c in cols) and any("gfp" in c.lower() for c in cols):
+            true_header_line = i
+            break
+
+    if true_header_line is None:
+        raise ValueError(f"Header row not found within first 5 lines: {filepath}")
+
+    df = pd.read_csv(filepath, skiprows=true_header_line)
+    df.columns = [c.strip() for c in df.columns]
+
+    required_cols = [
+        c for c in df.columns
+        if ("Time" in c) or ("gfp" in c.lower()) or ("tomato" in c.lower())
+    ]
+    if len(required_cols) == 0:
+        raise ValueError(f"Required columns not found (Time/GFP/Tomato): {filepath}")
+
+    return df[required_cols]
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Long-term fiber photometry batch analysis (lock-in demodulated CSV -> Z-score, metrics, SVG, Excel)."
+    )
+
+    # Paths (generic; no personal information)
+    parser.add_argument("--data_dir", type=str, default="./Dric_CSV", help="Input directory containing raw CSV files.")
+    parser.add_argument("--out_data_dir", type=str, default="./Dric_CSV_Finish", help="Output directory for per-animal CSV/SVG.")
+    parser.add_argument("--summary_out_dir", type=str, default="./Dric_CSV_Summary", help="Output directory for summary Excel files.")
+
+    # Baselines / windows
+    parser.add_argument("--baseline_global_start", type=float, default=1500.0, help="Global baseline interval start (s) for Z-score.")
+    parser.add_argument("--baseline_global_end", type=float, default=2100.0, help="Global baseline interval end (s) for Z-score.")
+
+    parser.add_argument("--pb_pre_start", type=float, default=100.0, help="Photobleaching pre-window start (s).")
+    parser.add_argument("--pb_pre_end", type=float, default=600.0, help="Photobleaching pre-window end (s).")
+
+    # End-anchored post window: [max_time - pb_post_start, max_time - pb_post_end]
+    parser.add_argument("--pb_post_start", type=float, default=500.0, help="Photobleaching post-window offset start from end (s).")
+    parser.add_argument("--pb_post_end", type=float, default=0.0, help="Photobleaching post-window offset end from end (s).")
+
+    # Plot window
+    parser.add_argument("--plot_start", type=float, default=2700.0, help="Plot start time (s).")
+    parser.add_argument("--plot_end_cap", type=float, default=24300.0, help="Plot end time cap (s).")
+
+    args = parser.parse_args()
+
+    data_dir = args.data_dir
+    out_data_dir = args.out_data_dir
+    summary_out_dir = args.summary_out_dir
+
+    os.makedirs(out_data_dir, exist_ok=True)
+    os.makedirs(summary_out_dir, exist_ok=True)
+
+    baseline_interval_global = (args.baseline_global_start, args.baseline_global_end)
+
+    window_defs = {
+        "2-4h": (7200.0, 14400.0),
+        "4-6h": (14400.0, 21600.0),
+    }
+
+    all_means = {}
+
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"Input directory not found: {data_dir}")
+
+    phmtry_files = [f for f in os.listdir(data_dir) if f.lower().endswith(".csv")]
+    if len(phmtry_files) == 0:
+        print(f"No CSV files found in: {data_dir}")
+        return
+
+    # -----------------------------
+    # Per-animal processing
+    # -----------------------------
+    for phmtry_file in phmtry_files:
+        print(f"\n=== Processing: {phmtry_file} ===")
+        animal = phmtry_file.split("_")[0]
+        filepath = os.path.join(data_dir, phmtry_file)
 
         try:
-            df = pd.read_csv(file_path, header=1)
-            gfp_col = [col for col in df.columns if 'gfp' in col.lower()]
-            tdt_col = [col for col in df.columns if 'tdtomato' in col.lower() or 'red' in col.lower() or 'tomato' in col.lower()]
-            if not gfp_col or not tdt_col:
-                print(f"⚠ カラムが見つかりません（{filename}）")
+            df_raw = read_and_clean_csv(filepath)
+        except Exception as e:
+            print(f"Skipping (read error): {e}")
+            continue
+
+        # Map columns into standardized names
+        col_map = {}
+        for col in df_raw.columns:
+            if "Time" in col:
+                col_map[col] = "time"
+            elif "gfp" in col.lower():
+                col_map[col] = "F-465"
+            elif "tomato" in col.lower():
+                col_map[col] = "AF-405"
+
+        # Ensure required standardized columns exist
+        df = df_raw.rename(columns=col_map)
+        required = ["time", "F-465", "AF-405"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"Skipping (missing columns {missing}): {phmtry_file}")
+            continue
+
+        df = df[required].dropna()
+
+        # Photobleaching correction intervals
+        max_time = float(df["time"].max())
+        pre_interval = (args.pb_pre_start, args.pb_pre_end)
+        post_interval = (max_time - args.pb_post_start, max_time - args.pb_post_end)
+
+        df["fluo465-pbc"] = correct_photobleaching(df["time"], df["F-465"], pre_interval, post_interval)
+        df["fluo405-pbc"] = correct_photobleaching(df["time"], df["AF-405"], pre_interval, post_interval)
+
+        df["fluo405-maf"], df["fluo465-mac"] = correct_motion(df["fluo465-pbc"], df["fluo405-pbc"])
+        df["fluo465-zsc"] = transform_to_zscore(df["time"], df["fluo465-mac"], baseline_interval=baseline_interval_global)
+
+        # Save per-animal processed CSV
+        csv_out_path = os.path.join(out_data_dir, f"{animal}-phmtry.csv")
+        df.to_csv(csv_out_path, index=False)
+
+        # SVG plot (plot_start to min(plot_end_cap, max_time))
+        plot_end_time = min(args.plot_end_cap, max_time)
+        df_window = df[(df["time"] >= args.plot_start) & (df["time"] <= plot_end_time)]
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(df_window["time"], df_window["fluo465-zsc"], color="tab:blue")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Z-score")
+        plt.title(f"{animal} - Z-Score ({args.plot_start/60:.0f}min - {plot_end_time/3600:.2f}h)")
+        plt.tight_layout()
+
+        svg_path = os.path.join(out_data_dir, f"{animal}-trace.svg")
+        plt.savefig(svg_path, format="svg")
+        plt.close()
+        print(f"Saved SVG: {svg_path}")
+
+        # Metrics per window
+        animal_metrics = {}
+        for label, (start_t, end_t) in window_defs.items():
+            win_start = max(args.plot_start, start_t)
+            win_end = min(end_t, plot_end_time)
+            if win_start >= win_end:
                 continue
 
-            gfp_all = df[gfp_col[0]].astype(float).values
-            tdt_all = df[tdt_col[0]].astype(float).values
-            total_points = min(len(gfp_all), len(tdt_all))
-            num_blocks = min(3, total_points // block_points)
+            w = df[(df["time"] >= win_start) & (df["time"] < win_end)].reset_index(drop=True)
+            if len(w) == 0:
+                continue
 
-            for i in range(num_blocks):
-                start = i * block_points
-                end = start + block_points
+            mean_z = float(w["fluo465-zsc"].mean())
+            std_z = float(w["fluo465-zsc"].std())
+            auc_z = float(compute_auc(w["time"], w["fluo465-zsc"]))
+            peak_z, peak_idx = compute_peak(w["fluo465-zsc"])
+            peak_time = float(w.loc[peak_idx, "time"])
 
-                gfp = gfp_all[start:end].reshape(-1, 1)
-                tdt = tdt_all[start:end].reshape(-1, 1)
-                if len(gfp) < block_points:
-                    continue
+            animal_metrics[f"{label}_mean"] = mean_z
+            animal_metrics[f"{label}_std"] = std_z
+            animal_metrics[f"{label}_auc"] = auc_z
+            animal_metrics[f"{label}_peak"] = peak_z
+            animal_metrics[f"{label}_peak_time"] = peak_time
 
-                block_label = f"{i*2}to{(i+1)*2}h"
-                sample_folder = os.path.join(output_folder, base_name)
-                block_output_folder = os.path.join(sample_folder, block_label)
-                result_folder = os.path.join(block_output_folder, 'result')
-                summary_folder = os.path.join(block_output_folder, 'summary')
-                os.makedirs(result_folder, exist_ok=True)
-                os.makedirs(summary_folder, exist_ok=True)
+            print(
+                f"{label}: mean={mean_z:.3f}, std={std_z:.3f}, auc={auc_z:.3f}, "
+                f"peak={peak_z:.3f}, peak_time={peak_time:.1f}"
+            )
 
-                gfp_smooth = pd.Series(gfp.flatten()).rolling(window=window_size, center=True, min_periods=1).median().values
-                gfp_detrended = gfp.flatten() - gfp_smooth
+        all_means[animal] = animal_metrics
 
-                model = LinearRegression()
-                model.fit(tdt, gfp_detrended.reshape(-1, 1))
-                gfp_fitted = model.predict(tdt)
-                gfp_corrected = gfp_detrended.reshape(-1, 1) - gfp_fitted
+    # -----------------------------
+    # Summary Excel (with explanation sheet)
+    # -----------------------------
+    results_list = []
+    for animal, metrics in all_means.items():
+        row = {"animal": animal}
+        row.update(metrics)
+        results_list.append(row)
+    results_df = pd.DataFrame(results_list)
 
-                baseline = gfp_corrected[:baseline_points]
-                z_score = (gfp_corrected - np.mean(baseline)) / np.std(baseline)
-                z_score = z_score.flatten()
-                time_axis_min = np.arange(len(z_score)) / (sampling_rate * 60)
-                valid_idx = time_axis_min != 0  # 0分を除く
+    explanation_data = [
+        {"Item": "mean", "Description": "Mean Z-score within the interval"},
+        {"Item": "std", "Description": "Standard deviation within the interval"},
+        {"Item": "auc", "Description": "Area Under the Curve (integral of Z-score within the interval)"},
+        {"Item": "peak", "Description": "Maximum Z-score within the interval"},
+        {"Item": "peak_time", "Description": "Time (s) at which the peak occurs"},
+    ]
+    explanation_df = pd.DataFrame(explanation_data)
 
-                baseline_fluo = np.mean(gfp[:baseline_points])
-                delta_f_over_f = (gfp.flatten() - baseline_fluo) / baseline_fluo
-                delta_f_over_f_z = (delta_f_over_f - np.mean(delta_f_over_f[:baseline_points])) / np.std(delta_f_over_f[:baseline_points])
+    excel_out_path = os.path.join(summary_out_dir, "summary_analysis.xlsx")
+    with pd.ExcelWriter(excel_out_path) as writer:
+        results_df.to_excel(writer, sheet_name="Summary", index=False)
+        explanation_df.to_excel(writer, sheet_name="Explanation", index=False)
+    print(f"\n✅ Saved summary Excel (2 sheets): {excel_out_path}")
 
-                peaks, _ = find_peaks(z_score, height=2)
-                auc = simpson(z_score[z_score > 0])
-                z_peaks = z_score[peaks]
-                z_peak_mean = np.mean(z_peaks) if len(z_peaks) > 0 else np.nan
-                z_peak_std = np.std(z_peaks) if len(z_peaks) > 0 else np.nan
+    # -----------------------------
+    # All-animal trace aggregation Excel (second-binned mean)
+    # -----------------------------
+    trace_files = glob.glob(os.path.join(out_data_dir, "*-phmtry.csv"))
+    all_traces = None
+    all_plot_end_times = []
 
-                # 2〜6h ΔF/F
-                start_idx = int(2 * 60 * sampling_rate)
-                end_idx = int(6 * 60 * sampling_rate)
-                if end_idx <= len(time_axis_min):
-                    deltaf_window = delta_f_over_f_z[start_idx:end_idx]
-                    deltaf_auc = simpson(deltaf_window)
-                    deltaf_peak = np.max(deltaf_window)
-                    deltaf_mean = np.mean(deltaf_window)
-                    deltaf_sd = np.std(deltaf_window)
-                else:
-                    deltaf_auc = np.nan
-                    deltaf_peak = np.nan
-                    deltaf_mean = np.nan
-                    deltaf_sd = np.nan
+    for fpath in trace_files:
+        df_trace = pd.read_csv(fpath)
+        animal_name = os.path.basename(fpath).split("-")[0]
 
-                summary_df = pd.DataFrame({
-                    'AUC': [auc],
-                    'Peak_Count': [len(peaks)],
-                    'Z_score_Peaks_Mean': [z_peak_mean],
-                    'Z_score_Peaks_SD': [z_peak_std],
-                    'DeltaF_2to6h_AUC': [deltaf_auc],
-                    'DeltaF_2to6h_Peak': [deltaf_peak],
-                    'DeltaF_2to6h_Mean': [deltaf_mean],
-                    'DeltaF_2to6h_SD': [deltaf_sd]
-                })
+        if "time" not in df_trace.columns or "fluo465-zsc" not in df_trace.columns:
+            continue
 
-                with pd.ExcelWriter(os.path.join(summary_folder, "summary.xlsx"), engine='openpyxl') as writer:
-                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        max_time_animal = float(df_trace["time"].max())
+        plot_end_time_animal = min(args.plot_end_cap, max_time_animal)
+        all_plot_end_times.append(plot_end_time_animal)
 
-                # グラフ出力
-                plt.figure()
-                plt.plot(time_axis_min[valid_idx], gfp[valid_idx], label='GFP (raw)', color='green')
-                plt.plot(time_axis_min[valid_idx], tdt[valid_idx], label='tdTomato', color='red')
-                plt.legend()
-                plt.title(f"{base_name}_{block_label} - Signal vs Control")
-                plt.xlabel('Time (min)')
-                plt.ylabel('Fluorescence')
-                plt.savefig(os.path.join(block_output_folder, "signal_vs_control.svg"))
-                plt.close()
+        df_trace = df_trace[["time", "fluo465-zsc"]].rename(columns={"fluo465-zsc": animal_name})
 
-                plt.figure()
-                plt.plot(time_axis_min[valid_idx], gfp_detrended[valid_idx], label='GFP Detrended', color='green')
-                plt.plot(time_axis_min[valid_idx], gfp_fitted[valid_idx], label='Fitted GFP from tdTomato', color='red')
-                plt.legend()
-                plt.title(f"{base_name}_{block_label} - Fitted Control")
-                plt.xlabel('Time (min)')
-                plt.ylabel('Signal')
-                plt.savefig(os.path.join(block_output_folder, "fitted_control.svg"))
-                plt.close()
+        if all_traces is None:
+            all_traces = df_trace
+        else:
+            all_traces = pd.merge(all_traces, df_trace, on="time", how="outer")
 
-                plt.figure()
-                plt.plot(time_axis_min[valid_idx], delta_f_over_f[valid_idx], label='Delta F/F', color='green')
-                plt.plot(time_axis_min[valid_idx], delta_f_over_f_z[valid_idx], label='Normalized Delta F/F', color='red')
-                plt.legend()
-                plt.title(f"{base_name}_{block_label} - Delta F/F")
-                plt.xlabel('Time (min)')
-                plt.ylabel('Value')
-                plt.savefig(os.path.join(block_output_folder, "deltaF.svg"))
-                plt.close()
+    if all_traces is None or len(all_plot_end_times) == 0:
+        print("No per-animal trace files found for aggregation.")
+        return
 
-                if end_idx <= len(time_axis_min):
-                    plt.figure()
-                    plt.plot(time_axis_min[start_idx:end_idx], delta_f_over_f[start_idx:end_idx], label='Delta F/F', color='green')
-                    plt.plot(time_axis_min[start_idx:end_idx], delta_f_over_f_z[start_idx:end_idx], label='Normalized Delta F/F', color='red')
-                    plt.legend()
-                    plt.title(f"{base_name}_{block_label} - Delta F/F (2h-6h)")
-                    plt.xlabel('Time (min)')
-                    plt.ylabel('Value')
-                    plt.savefig(os.path.join(block_output_folder, "deltaF_2to6h.svg"))
-                    plt.close()
+    global_plot_end_time = min(all_plot_end_times)
+    all_traces = all_traces[(all_traces["time"] >= args.plot_start) & (all_traces["time"] <= global_plot_end_time)]
 
-                plt.figure()
-                plt.plot(time_axis_min[valid_idx], z_score[valid_idx], label='Z-score')
-                valid_peaks = peaks[time_axis_min[peaks] != 0]
-                plt.plot(time_axis_min[valid_peaks], z_score[valid_peaks], "x", label='Peaks')
-                plt.legend()
-                plt.title(f"{base_name}_{block_label} - Z-score Peaks")
-                plt.xlabel('Time (min)')
-                plt.ylabel('Z')
-                plt.savefig(os.path.join(block_output_folder, "zscore_peaks.svg"))
-                plt.close()
+    # Second-binning: round to int seconds, then average where multiple samples fall in the same second
+    all_traces["time"] = all_traces["time"].round().astype(int)
+    all_traces_reduced = all_traces.groupby("time").mean().reset_index().sort_values("time")
 
-                print(f"✅ {base_name}_{block_label} 完了")
+    all_zscore_out = os.path.join(summary_out_dir, "all_animals_traces.xlsx")
+    all_traces_reduced.to_excel(all_zscore_out, index=False)
+    print(f"✅ Saved all-animal trace Excel: {all_zscore_out}")
 
-        except Exception as e:
-            print(f"❌ エラー（{filename}）: {e}")
 
-# summary統合
-all_summaries = []
-for sample_name in sample_names:
-    sample_folder = os.path.join(output_folder, sample_name)
-    if not os.path.isdir(sample_folder):
-        continue
-    for block_folder in os.listdir(sample_folder):
-        summary_path = os.path.join(sample_folder, block_folder, 'summary', 'summary.xlsx')
-        if os.path.exists(summary_path):
-            df = pd.read_excel(summary_path, engine='openpyxl')
-            df.insert(0, 'Sample', sample_name)
-            df.insert(1, 'Block', block_folder)
-            all_summaries.append(df)
+if __name__ == "__main__":
+    main()
 
-if all_summaries:
-    all_summary_df = pd.concat(all_summaries, ignore_index=True)
-    all_summary_path = os.path.join(output_folder, 'All_summary.xlsx')
-    all_summary_df.to_excel(all_summary_path, index=False)
-    print(f"📊 All_summary.xlsx 出力完了: {all_summary_path}")
-else:
-    print("⚠ 統合対象 summary.xlsx が見つかりませんでした。")
